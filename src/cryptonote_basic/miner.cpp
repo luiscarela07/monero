@@ -107,6 +107,7 @@ namespace cryptonote
     m_template{},
     m_template_no(0),
     m_diffic(0),
+    m_seed_hash(crypto::null_hash),
     m_thread_index(0),
     m_phandler(phandler),
     m_gbh(gbh),
@@ -137,11 +138,12 @@ namespace cryptonote
     catch (...) { /* ignore */ }
   }
   //-----------------------------------------------------------------------------------------------------
-  bool miner::set_block_template(const block& bl, const difficulty_type& di, uint64_t height, uint64_t block_reward)
+  bool miner::set_block_template(const block& bl, const difficulty_type& di, uint64_t height, uint64_t block_reward, const crypto::hash &seed_hash)
   {
     CRITICAL_REGION_LOCAL(m_template_lock);
     m_template = bl;
     m_diffic = di;
+    m_seed_hash = seed_hash;
     m_height = height;
     m_block_reward = block_reward;
     ++m_template_no;
@@ -178,7 +180,7 @@ namespace cryptonote
       LOG_ERROR("Failed to get_block_template(), stopping mining");
       return false;
     }
-    set_block_template(bl, di, height, expected_reward);
+    set_block_template(bl, di, height, expected_reward, seed_hash);
     return true;
   }
   //-----------------------------------------------------------------------------------------------------
@@ -521,6 +523,35 @@ namespace cryptonote
       MDEBUG("MINING RESUMED");
   }
   //-----------------------------------------------------------------------------------------------------
+  // The block header serialises its nonce little endian, and rx_slow_hash_nonce_range()
+  // writes it the same way, so keep one encoder for both rather than memcpying a host
+  // ordered uint32_t over it.
+  static void store_nonce_le(char *p, uint32_t nonce)
+  {
+    p[0] = (char)(nonce & 0xff);
+    p[1] = (char)((nonce >> 8) & 0xff);
+    p[2] = (char)((nonce >> 16) & 0xff);
+    p[3] = (char)((nonce >> 24) & 0xff);
+  }
+  //-----------------------------------------------------------------------------------------------------
+  void miner::submit_block(block &b, uint64_t height, const difficulty_type &diffic)
+  {
+    //we lucky!
+    b.invalidate_hashes(); // the nonce was written straight into the header, drop any cached hash
+    ++m_config.current_extra_message_index;
+    MGINFO_GREEN("Found block " << get_block_hash(b) << " at height " << height << " for difficulty: " << diffic);
+    cryptonote::block_verification_context bvc;
+    if(!m_phandler->handle_block_found(b, bvc) || !bvc.m_added_to_main_chain)
+    {
+      --m_config.current_extra_message_index;
+    }else
+    {
+      //success update, lets update config
+      if (!m_config_folder_path.empty())
+        epee::serialization::store_t_to_json_file(m_config, m_config_folder_path + "/" + MINER_CONFIG_FILE_NAME);
+    }
+  }
+  //-----------------------------------------------------------------------------------------------------
   bool miner::worker_thread()
   {
     const uint32_t th_local_index = m_thread_index++; // atomically increment, getting value before increment
@@ -533,6 +564,13 @@ namespace cryptonote
     difficulty_type local_diff = 0;
     uint32_t local_template_ver = 0;
     block b;
+    crypto::hash seed_hash = crypto::null_hash;
+    // Everything in the hashing blob except the nonce is fixed for a given block
+    // template, so it is built once per template rather than once per attempt.
+    blobdata hashing_blob;
+    size_t nonce_offset = 0;
+    bool batch_nonces = false;
+    crypto::hash hashes[NONCE_BATCH_SIZE];
     slow_hash_allocate_state();
     ++m_threads_active;
     while(!m_stop)
@@ -561,10 +599,36 @@ namespace cryptonote
         CRITICAL_REGION_BEGIN(m_template_lock);
         b = m_template;
         local_diff = m_diffic;
+        seed_hash = m_seed_hash;
         height = m_height;
         CRITICAL_REGION_END();
         local_template_ver = m_template_no;
         nonce = m_starter_nonce + th_local_index;
+
+        // Cache the hashing blob so the nonce loop below only has to overwrite four
+        // bytes, rather than reserialising the coinbase tx, rebuilding the tx merkle
+        // tree and looking the seed hash up in the db once per hash. Height 202612 is
+        // special cased in get_block_longhash(), so leave it on the generic path.
+        // The template only carries a seed hash once the chain is on RandomX; without
+        // one we cannot hash the blob ourselves and have to go through m_gbh, which
+        // looks the seed hash up for itself.
+        batch_nonces = b.major_version >= RX_BLOCK_VERSION && height != 202612 && seed_hash != crypto::null_hash;
+        if (batch_nonces)
+        {
+          hashing_blob = get_block_hashing_blob(b, &nonce_offset);
+          // Make sure patching the nonce in place really is equivalent to rebuilding
+          // the blob, so a change to how blocks are serialised can never quietly turn
+          // this into a miner that submits invalid blocks.
+          block test_block = b;
+          test_block.nonce = ~b.nonce;
+          blobdata test_blob = hashing_blob;
+          store_nonce_le(&test_blob[nonce_offset], test_block.nonce);
+          if (test_blob != get_block_hashing_blob(test_block))
+          {
+            MERROR("Block hashing blob does not vary only by its nonce, falling back to the slow mining path");
+            batch_nonces = false;
+          }
+        }
       }
 
       if(!local_template_ver)//no any set_block_template call
@@ -574,9 +638,6 @@ namespace cryptonote
         continue;
       }
 
-      b.nonce = nonce;
-      crypto::hash h;
-
       if ((b.major_version >= RX_BLOCK_VERSION) && !rx_set)
       {
         // Must be non-zero value because 0 means "not a miner thread, run with secure JIT" in rx-slow-hash.c
@@ -584,27 +645,41 @@ namespace cryptonote
         rx_set = true;
       }
 
-      m_gbh(b, height, NULL, tools::get_max_concurrency(), h);
+      // Threads interleave nonces, so each one steps by the number of miner threads
+      const uint32_t threads_total = m_threads_total;
+      const uint32_t nonce_step = threads_total ? threads_total : 1;
 
-      if(check_hash(h, local_diff))
+      if (batch_nonces)
       {
-        //we lucky!
-        ++m_config.current_extra_message_index;
-        MGINFO_GREEN("Found block " << get_block_hash(b) << " at height " << height << " for difficulty: " << local_diff);
-        cryptonote::block_verification_context bvc;
-        if(!m_phandler->handle_block_found(b, bvc) || !bvc.m_added_to_main_chain)
+        crypto::rx_slow_hash_nonce_range(seed_hash.data, &hashing_blob[0], hashing_blob.size(),
+          nonce_offset, nonce, nonce_step, NONCE_BATCH_SIZE, reinterpret_cast<char*>(hashes));
+
+        for (size_t i = 0; i < NONCE_BATCH_SIZE; ++i)
         {
-          --m_config.current_extra_message_index;
-        }else
-        {
-          //success update, lets update config
-          if (!m_config_folder_path.empty())
-            epee::serialization::store_t_to_json_file(m_config, m_config_folder_path + "/" + MINER_CONFIG_FILE_NAME);
+          if (check_hash(hashes[i], local_diff))
+          {
+            b.nonce = nonce + (uint32_t)i * nonce_step;
+            submit_block(b, height, local_diff);
+          }
         }
+        nonce += nonce_step * NONCE_BATCH_SIZE;
+        m_hashes += NONCE_BATCH_SIZE;
+        m_total_hashes += NONCE_BATCH_SIZE;
       }
-      nonce+=m_threads_total;
-      ++m_hashes;
-      ++m_total_hashes;
+      else
+      {
+        b.nonce = nonce;
+        crypto::hash h;
+
+        m_gbh(b, height, NULL, tools::get_max_concurrency(), h);
+
+        if(check_hash(h, local_diff))
+          submit_block(b, height, local_diff);
+
+        nonce += nonce_step;
+        ++m_hashes;
+        ++m_total_hashes;
+      }
     }
     slow_hash_free_state();
     MGINFO("Miner thread stopped ["<< th_local_index << "]");

@@ -66,7 +66,7 @@ namespace cryptonote
     ~miner();
     bool init(const boost::program_options::variables_map& vm, network_type nettype);
     static void init_options(boost::program_options::options_description& desc);
-    bool set_block_template(const block& bl, const difficulty_type& diffic, uint64_t height, uint64_t block_reward);
+    bool set_block_template(const block& bl, const difficulty_type& diffic, uint64_t height, uint64_t block_reward, const crypto::hash &seed_hash);
     bool on_block_chain_update();
     bool start(const account_public_address& adr, size_t threads_count, bool do_background = false, bool ignore_battery = false);
     uint64_t get_speed() const;
@@ -104,9 +104,16 @@ namespace cryptonote
     static constexpr uint8_t  BACKGROUND_MINING_MINER_MONITOR_INVERVAL_IN_SECONDS       = 10;
     static constexpr uint64_t BACKGROUND_MINING_DEFAULT_MINER_EXTRA_SLEEP_MILLIS        = 400; // ramp up 
 
+    // Number of nonces a worker hands to RandomX at a time. Batching lets RandomX
+    // overlap the scratchpad fill of one nonce with the finalisation of the previous
+    // one; it costs up to this many hashes of latency in noticing a stop request or a
+    // new block template, which at RandomX speeds is single digit milliseconds.
+    static constexpr size_t NONCE_BATCH_SIZE = 8;
+
   private:
     bool worker_thread();
     bool request_block_template();
+    void submit_block(block &b, uint64_t height, const difficulty_type &diffic);
     void  merge_hr();
     void  update_autodetection();
     
@@ -126,6 +133,7 @@ namespace cryptonote
     std::atomic<uint32_t> m_template_no;
     std::atomic<uint32_t> m_starter_nonce;
     difficulty_type m_diffic;
+    crypto::hash m_seed_hash;
     uint64_t m_height;
     std::atomic<uint32_t> m_thread_index;
     volatile uint32_t m_threads_total;

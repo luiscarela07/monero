@@ -106,5 +106,20 @@ void rx_seedheights(const uint64_t height, uint64_t *seed_height, uint64_t *next
 void rx_set_main_seedhash(const char *seedhash, size_t max_dataset_init_threads);
 void rx_slow_hash(const char *seedhash, const void *data, size_t length, char *result_hash);
 
+/* Hashes a run of consecutive nonces over a single block hashing blob.
+ *
+ * blob is written to in place: before each hash, the four bytes at nonce_offset
+ * are set, little endian, to start_nonce + i * nonce_step. The hash of the i-th
+ * nonce is written to out_hashes + i * HASH_SIZE, so out_hashes must have room
+ * for count hashes.
+ *
+ * Equivalent to patching the nonce and calling rx_slow_hash() count times, but
+ * when the main dataset is usable the hashes are pipelined: the scratchpad for
+ * one nonce is filled in the same pass over memory that finalises the previous
+ * one. The caller keeps ownership of the blob and stays responsible for
+ * checking the hashes against the difficulty. */
+void rx_slow_hash_nonce_range(const char *seedhash, void *blob, size_t length, size_t nonce_offset,
+  uint32_t start_nonce, uint32_t nonce_step, size_t count, char *out_hashes);
+
 void rx_set_miner_thread(uint32_t value, size_t max_dataset_init_threads);
 uint32_t rx_get_miner_thread(void);

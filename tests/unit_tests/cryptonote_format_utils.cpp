@@ -271,6 +271,50 @@ TEST(cn_format_utils, block_longhash_reconstruct_existing_202612)
     ASSERT_EQ(EXISTING_BLOCK_POW_HASH_202612, epee::string_tools::pod_to_hex(pow_hash));
 }
 
+TEST(cn_format_utils, block_hashing_blob_nonce_offset)
+{
+    // The miner builds the hashing blob once per block template and then only overwrites
+    // the nonce in place, so patching those four bytes has to be indistinguishable from
+    // reserialising the whole block.
+    const auto block_202612_blob_path = unit_test::data_dir / "blocks" / "block_202612_mainnet.bin";
+    cryptonote::blobdata block_blob;
+    ASSERT_TRUE(epee::file_io_utils::load_file_to_string(block_202612_blob_path.string(), block_blob));
+
+    cryptonote::block block;
+    ASSERT_TRUE(cryptonote::parse_and_validate_block_from_blob(block_blob, block));
+
+    // vary the fields serialised ahead of the nonce, since they are varints and so move it
+    static const uint64_t timestamps[] = {0, 127, 128, 16383, 16384, 1700000000ull};
+    static const uint8_t versions[] = {1, 12, 16, 127, 128};
+    static const uint32_t nonces[] = {0, 1, 0xff, 0x100, 0x7fffffff, 0x80000000, 0xffffffff, 0xdeadbeef};
+
+    for (uint64_t timestamp : timestamps)
+    for (uint8_t version : versions)
+    {
+        block.timestamp = timestamp;
+        block.major_version = version;
+        block.minor_version = version;
+        block.nonce = 0;
+
+        size_t nonce_offset = 0;
+        const cryptonote::blobdata blob = cryptonote::get_block_hashing_blob(block, &nonce_offset);
+        ASSERT_LE(nonce_offset + sizeof(block.nonce), blob.size());
+
+        for (uint32_t nonce : nonces)
+        {
+            block.nonce = nonce;
+
+            cryptonote::blobdata patched = blob;
+            patched[nonce_offset + 0] = (char) (nonce & 0xff);
+            patched[nonce_offset + 1] = (char) ((nonce >> 8) & 0xff);
+            patched[nonce_offset + 2] = (char) ((nonce >> 16) & 0xff);
+            patched[nonce_offset + 3] = (char) ((nonce >> 24) & 0xff);
+
+            ASSERT_EQ(cryptonote::get_block_hashing_blob(block), patched);
+        }
+    }
+}
+
 TEST(cn_format_utils, add_mm_merkle_root_to_tx_extra)
 {
     const std::vector<std::uint64_t> depths{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 63, 64, 127, 128, 16383, 16384};

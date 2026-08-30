@@ -146,7 +146,10 @@ namespace cryptonote
   bool calculate_transaction_hash(const transaction& t, crypto::hash& res, size_t* blob_size);
   bool get_pruned_transaction_hash(const transaction& t, const crypto::hash &pruned_data_hash, crypto::hash& res);
 
-  blobdata get_block_hashing_blob(const block& b);
+  // If nonce_offset is given, it receives the offset of the block's nonce within the
+  // returned blob, so a caller varying only the nonce (ie. a miner) can overwrite those
+  // four bytes in place instead of rebuilding the blob for every attempt.
+  blobdata get_block_hashing_blob(const block& b, size_t *nonce_offset = NULL);
   bool calculate_block_hash(const block& b, crypto::hash& res, const blobdata_ref *blob = NULL);
   bool get_block_hash(const block& b, crypto::hash& res);
   crypto::hash get_block_hash(const block& b);
