@@ -1602,9 +1602,16 @@ namespace cryptonote
     return get_transaction_hash(t, res, &blob_size);
   }
   //---------------------------------------------------------------
-  blobdata get_block_hashing_blob(const block& b)
+  blobdata get_block_hashing_blob(const block& b, size_t *nonce_offset)
   {
     blobdata blob = t_serializable_object_to_blob(static_cast<block_header>(b));
+    if (nonce_offset)
+    {
+      // the nonce is the last field of the serialised header, and the only fixed
+      // width one, so everything ahead of it keeps its offset as the header changes
+      CHECK_AND_ASSERT_THROW_MES(blob.size() >= sizeof(b.nonce), "Block header blob is too small to hold a nonce");
+      *nonce_offset = blob.size() - sizeof(b.nonce);
+    }
     crypto::hash tree_root_hash = get_tx_tree_hash(b);
     blob.append(reinterpret_cast<const char*>(&tree_root_hash), sizeof(tree_root_hash));
     blob.append(tools::get_varint_data(b.tx_hashes.size()+1));

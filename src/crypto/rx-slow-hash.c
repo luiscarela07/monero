@@ -41,6 +41,18 @@
 #include "hash-ops.h"
 #include "misc_log_ex.h"
 
+/* randomx_calculate_hash() saves and restores the floating point state around
+ * each hash, but the pipelined randomx_calculate_hash_first/next/last() do not:
+ * that is left to whoever drives the chain. Mirror the way RandomX itself picks
+ * between the SSE control register and fenv so we have the same link-time
+ * requirements it does. */
+#if defined(__SSE__) || defined(__SSE2__) || (defined(_M_IX86_FP) && (_M_IX86_FP > 0))
+#define RX_USE_CSR_INTRINSICS
+#include <xmmintrin.h>
+#else
+#include <fenv.h>
+#endif
+
 #define RX_LOGCAT	"randomx"
 
 // Report large page allocation failures as debug messages
@@ -485,6 +497,75 @@ void rx_slow_hash(const char *seedhash, const void *data, size_t length, char *r
   rx_init_light_vm(flags, &secondary_vm_light, secondary_cache);
   randomx_calculate_hash(secondary_vm_light, data, length, result_hash);
   CTHR_RWLOCK_UNLOCK_WRITE(secondary_cache_lock);
+}
+
+static inline void rx_store_nonce(uint8_t *p, uint32_t nonce) {
+  p[0] = (uint8_t)(nonce);
+  p[1] = (uint8_t)(nonce >> 8);
+  p[2] = (uint8_t)(nonce >> 16);
+  p[3] = (uint8_t)(nonce >> 24);
+}
+
+void rx_slow_hash_nonce_range(const char *seedhash, void *blob, size_t length, size_t nonce_offset,
+  uint32_t start_nonce, uint32_t nonce_step, size_t count, char *out_hashes) {
+  uint8_t *const nonce_ptr = (uint8_t*)blob + nonce_offset;
+  uint32_t nonce;
+  size_t i;
+
+  if (!count) {
+    return;
+  }
+
+  // Fast path: the main seed hash with a dataset that is not being rebuilt right now.
+  // A failed trylock means the dataset is being initialized, so fall through to the
+  // light mode loop below rather than blocking the whole batch on it.
+  if (main_dataset && is_main(seedhash) && CTHR_RWLOCK_TRYLOCK_READ(main_dataset_lock)) {
+    int done = 0;
+    // Double check that main_seedhash didn't change
+    if (is_main(seedhash)) {
+      const randomx_flags flags = enabled_flags() & ~disabled_flags();
+      rx_init_full_vm(flags, &main_vm_full);
+      if (main_vm_full) {
+#ifdef RX_USE_CSR_INTRINSICS
+        const unsigned int fpstate = _mm_getcsr();
+#else
+        fenv_t fpstate;
+        fegetenv(&fpstate);
+#endif
+        // hash_next() emits the hash of the nonce submitted by the previous call
+        // while filling the scratchpad for the nonce it is given, so the nonce
+        // written before each call is one ahead of the hash that comes out.
+        nonce = start_nonce;
+        rx_store_nonce(nonce_ptr, nonce);
+        randomx_calculate_hash_first(main_vm_full, blob, length);
+        for (i = 1; i < count; ++i) {
+          nonce += nonce_step;
+          rx_store_nonce(nonce_ptr, nonce);
+          randomx_calculate_hash_next(main_vm_full, blob, length, out_hashes + (i - 1) * HASH_SIZE);
+        }
+        randomx_calculate_hash_last(main_vm_full, out_hashes + (count - 1) * HASH_SIZE);
+#ifdef RX_USE_CSR_INTRINSICS
+        _mm_setcsr(fpstate);
+#else
+        fesetenv(&fpstate);
+#endif
+        done = 1;
+      }
+    }
+    CTHR_RWLOCK_UNLOCK_READ(main_dataset_lock);
+    if (done) {
+      return;
+    }
+  }
+
+  // Slow path: light mode, a secondary seed hash, or a seed change. rx_slow_hash()
+  // re-checks the seed hash per call, so a change part way through a range is handled.
+  nonce = start_nonce;
+  for (i = 0; i < count; ++i) {
+    rx_store_nonce(nonce_ptr, nonce);
+    rx_slow_hash(seedhash, blob, length, out_hashes + i * HASH_SIZE);
+    nonce += nonce_step;
+  }
 }
 
 void rx_set_miner_thread(uint32_t value, size_t max_dataset_init_threads) {
